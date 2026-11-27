@@ -16,6 +16,19 @@ from werkzeug.utils import secure_filename
 # Load env vars (Vercel will provide these in the dashboard)
 load_dotenv()
 
+IS_VERCEL = os.getenv("VERCEL") == "1"
+if IS_VERCEL:
+    required_env = ("DATABASE_URL", "SECRET_KEY", "ADMIN_PASSWORD")
+    missing_env = [
+        name for name in required_env
+        if not os.getenv(name, "").strip()
+    ]
+    if missing_env:
+        raise RuntimeError(
+            "Missing required Vercel environment variables: "
+            + ", ".join(missing_env)
+        )
+
 app = Flask(__name__)
 # Vercel requires a secret key for sessions, fallback to random for local dev
 app.secret_key = os.getenv("SECRET_KEY", "dev-" + os.urandom(16).hex())
@@ -25,6 +38,8 @@ db_url = os.getenv("DATABASE_URL", "").strip()
 if db_url.startswith("postgres://"):
     db_url = db_url.replace("postgres://", "postgresql://", 1)
 if not db_url:
+    if IS_VERCEL:
+        raise RuntimeError("DATABASE_URL must be configured on Vercel.")
     # Note: SQLite will NOT persist between Vercel serverless invocations. 
     # You should use a Postgres database (like Neon or Supabase) in production.
     db_url = "sqlite:///portfolio.db"
@@ -989,7 +1004,7 @@ def admin_upload_hero():
                 io.BytesIO(file_bytes),
                 BUCKET,
                 key,
-                ExtraArgs={"ContentType": file.content_type or f"image/{ext}", "ACL": "public-read"}
+                ExtraArgs={"ContentType": file.content_type or f"image/{ext}"}
             )
             endpoint = os.getenv("AWS_ENDPOINT_URL_S3", "")
             if endpoint:
