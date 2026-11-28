@@ -64,6 +64,7 @@ if AWS_ENDPOINT:
             config=Config(
                 signature_version="s3v4",
                 s3={"addressing_style": "path"},  # REQUIRED for Neon S3
+                request_checksum_calculation="when_required",
                 retries={"max_attempts": 3, "mode": "standard"},
             ),
         )
@@ -96,7 +97,6 @@ def s3_upload_and_url(key: str, data: bytes, content_type: str) -> str:
         Key=key,
         Body=data,
         ContentType=content_type,
-        ACL="public-read",  # Remove if your Neon bucket rejects ACLs; make bucket public instead.
     )
     return s3_public_url(key)
 
