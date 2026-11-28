@@ -8,29 +8,22 @@ from urllib.parse import urlparse, unquote
 from functools import wraps
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
-from flask import Flask, request, jsonify, session, redirect, url_for
+from flask import Flask, request, jsonify, session, redirect, url_for, Response
 from flask_sqlalchemy import SQLAlchemy
 from dotenv import load_dotenv
 from werkzeug.utils import secure_filename
 
-# Load env vars (Vercel will provide these in the dashboard)
+# ---------------- ENV ----------------
 load_dotenv()
 
 IS_VERCEL = os.getenv("VERCEL") == "1"
 if IS_VERCEL:
     required_env = ("DATABASE_URL", "SECRET_KEY", "ADMIN_PASSWORD")
-    missing_env = [
-        name for name in required_env
-        if not os.getenv(name, "").strip()
-    ]
+    missing_env = [n for n in required_env if not os.getenv(n, "").strip()]
     if missing_env:
-        raise RuntimeError(
-            "Missing required Vercel environment variables: "
-            + ", ".join(missing_env)
-        )
+        raise RuntimeError("Missing required Vercel environment variables: " + ", ".join(missing_env))
 
 app = Flask(__name__)
-# Vercel requires a secret key for sessions, fallback to random for local dev
 app.secret_key = os.getenv("SECRET_KEY", "dev-" + os.urandom(16).hex())
 
 # ---------------- DATABASE ----------------
@@ -40,8 +33,6 @@ if db_url.startswith("postgres://"):
 if not db_url:
     if IS_VERCEL:
         raise RuntimeError("DATABASE_URL must be configured on Vercel.")
-    # Note: SQLite will NOT persist between Vercel serverless invocations. 
-    # You should use a Postgres database (like Neon or Supabase) in production.
     db_url = "sqlite:///portfolio.db"
 
 app.config["SQLALCHEMY_DATABASE_URI"] = db_url
@@ -51,22 +42,64 @@ app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
 db = SQLAlchemy(app)
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
 
-# ---------------- S3 (lazy-safe) ----------------
-S3_ERROR = None
-try:
-    s3 = boto3.client(
-        "s3",
-        endpoint_url=os.getenv("AWS_ENDPOINT_URL_S3") or None,
-        aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
-        aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
-        region_name=os.getenv("AWS_DEFAULT_REGION", "us-east-2"),
-        config=Config(signature_version="s3v4"),
-    )
-except Exception as e:
-    s3 = None
-    S3_ERROR = str(e)
+# ---------------- S3 (Neon object storage) ----------------
+AWS_REGION = (
+    os.getenv("AWS_REGION")
+    or os.getenv("AWS_DEFAULT_REGION")
+    or "us-east-2"
+)
+AWS_ENDPOINT = (os.getenv("AWS_ENDPOINT_URL_S3") or "").rstrip("/") or None
+BUCKET = os.getenv("NEON_S3_BUCKET", "s3-bucket-divya")
 
-BUCKET = os.getenv("NEON_S3_BUCKET", "s3-bucket-1232")
+S3_ERROR = None
+s3 = None
+if AWS_ENDPOINT:
+    try:
+        s3 = boto3.client(
+            "s3",
+            endpoint_url=AWS_ENDPOINT,
+            aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+            aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+            region_name=AWS_REGION,
+            config=Config(
+                signature_version="s3v4",
+                s3={"addressing_style": "path"},  # REQUIRED for Neon S3
+                retries={"max_attempts": 3, "mode": "standard"},
+            ),
+        )
+        app.logger.info(
+            "S3 ready: endpoint=%s bucket=%s region=%s",
+            AWS_ENDPOINT, BUCKET, AWS_REGION,
+        )
+    except Exception as e:
+        s3 = None
+        S3_ERROR = str(e)
+        app.logger.exception("S3 init failed")
+else:
+    S3_ERROR = "AWS_ENDPOINT_URL_S3 not set"
+    app.logger.warning("S3 disabled: %s", S3_ERROR)
+
+
+def s3_public_url(key: str) -> str:
+    """Path-style public URL: {endpoint}/{bucket}/{key}"""
+    if not AWS_ENDPOINT:
+        return ""
+    return f"{AWS_ENDPOINT}/{BUCKET}/{key}"
+
+
+def s3_upload_and_url(key: str, data: bytes, content_type: str) -> str:
+    """Upload bytes to Neon S3 and return public URL. Raises on failure."""
+    if s3 is None:
+        raise RuntimeError(f"S3 not configured: {S3_ERROR}")
+    s3.put_object(
+        Bucket=BUCKET,
+        Key=key,
+        Body=data,
+        ContentType=content_type,
+        ACL="public-read",  # Remove if your Neon bucket rejects ACLs; make bucket public instead.
+    )
+    return s3_public_url(key)
+
 
 # ---------------- FONTS ----------------
 FONT_CHOICES = {
@@ -126,6 +159,7 @@ FONT_CHOICES = {
 }
 DEFAULT_FONT = "Inter"
 
+
 # ---------------- MODELS ----------------
 class ContactMessage(db.Model):
     __tablename__ = "messages"
@@ -135,11 +169,13 @@ class ContactMessage(db.Model):
     message = db.Column(db.Text, nullable=False)
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
 
+
 class SiteContent(db.Model):
     __tablename__ = "site_content"
     id = db.Column(db.Integer, primary_key=True)
     key = db.Column(db.String(50), unique=True, nullable=False)
     value = db.Column(db.Text, default="")
+
 
 class Project(db.Model):
     __tablename__ = "projects"
@@ -152,6 +188,7 @@ class Project(db.Model):
     file_url = db.Column(db.Text)
     media_url = db.Column(db.Text)
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+
 
 # ---------------- DEFAULTS ----------------
 with app.app_context():
@@ -189,9 +226,11 @@ with app.app_context():
             db.session.add(SiteContent(key=k, value=v))
     db.session.commit()
 
+
 # ---------------- HELPERS ----------------
 def is_admin():
     return session.get("admin") is True
+
 
 def admin_required(f):
     @wraps(f)
@@ -201,8 +240,10 @@ def admin_required(f):
         return f(*a, **kw)
     return wrapper
 
+
 def get_content():
     return {c.key: c.value for c in SiteContent.query.all()}
+
 
 def build_font_url(font):
     if font not in FONT_CHOICES:
@@ -211,6 +252,7 @@ def build_font_url(font):
     weight_q = ";".join(str(w) for w in weights)
     font_q = font.replace(" ", "+")
     return f"https://fonts.googleapis.com/css2?family={font_q}:wght@{weight_q}&display=swap"
+
 
 def get_theme_css(content):
     font = content.get("font_family", DEFAULT_FONT) or DEFAULT_FONT
@@ -306,6 +348,7 @@ def get_theme_css(content):
     </style>
     """
 
+
 def get_navbar(content):
     return f"""
     <header>
@@ -328,6 +371,7 @@ def get_navbar(content):
     </header>
     """
 
+
 def get_footer(content):
     year = datetime.now(timezone.utc).year
     return f"""
@@ -339,11 +383,21 @@ def get_footer(content):
     </footer>
     """
 
+
 def hero_image_html(content):
     url = (content.get("hero_image") or "").strip()
     if url:
-        return f'<img src="{url}" alt="Profile Photo">'
+        safe_url = url.replace('"', "%22")
+        return (
+            f'<img src="{safe_url}" alt="Profile Photo" '
+            f'onerror="this.style.display=\'none\';'
+            f'var p=document.createElement(\'div\');'
+            f'p.className=\'placeholder\';'
+            f'p.innerHTML=\'Image failed to load.<br>Check the URL or re-upload from Admin Panel.\';'
+            f'this.parentNode.appendChild(p);">'
+        )
     return '<div class="placeholder">No profile image yet.<br>Upload one from the Admin Panel.</div>'
+
 
 # ---------------- PUBLIC ROUTES ----------------
 @app.route("/")
@@ -462,6 +516,7 @@ def home():
     """
     return html
 
+
 @app.route("/submit", methods=["POST"])
 def submit():
     data = request.get_json(silent=True) or request.form
@@ -473,6 +528,7 @@ def submit():
     db.session.add(ContactMessage(name=name, email=email, message=message))
     db.session.commit()
     return jsonify({"ok": True})
+
 
 # ---------------- AUTH ----------------
 @app.route("/login", methods=["GET", "POST"])
@@ -499,10 +555,12 @@ def login():
     </body></html>
     """
 
+
 @app.route("/logout")
 def logout():
     session.clear()
     return redirect(url_for("home"))
+
 
 # ---------------- ADMIN DASHBOARD ----------------
 @app.route("/admin")
@@ -550,13 +608,37 @@ def admin():
 
     current_hero = (content.get("hero_image") or "").strip()
     if current_hero:
-        hero_preview = f'<img id="hero_image_preview" src="{current_hero}" alt="Preview" style="width:100%; height:100%; object-fit:cover;">'
+        safe_hero = current_hero.replace('"', "%22")
+        onerr = (
+            "this.onerror=null;"
+            "this.style.display='none';"
+            "var p=this.parentNode;"
+            "p.innerHTML='<div style=\"color:#ef4444;font-size:0.75rem;"
+            "display:flex;align-items:center;justify-content:center;"
+            "height:100%;text-align:center;padding:10px;\">"
+            "Image failed to load.<br>Check S3 bucket public access.</div>';"
+        )
+        hero_preview = (
+            f'<img id="hero_image_preview" src="{safe_hero}" alt="Preview" '
+            f'style="width:100%;height:100%;object-fit:cover;" loading="lazy" '
+            f'onerror="{onerr}">'
+        )
         hero_has_file = " has-file"
         hero_filename = "Current image loaded"
+        hero_url_html = (
+            f'<div style="margin-top:10px;font-size:0.75rem;color:#777;word-break:break-all;">'
+            f'Stored URL: <a href="{safe_hero}" target="_blank" rel="noopener" '
+            f'style="color:#65a30d;">{current_hero}</a></div>'
+        )
     else:
-        hero_preview = '<div id="hero_image_preview" style="width:100%; height:100%; display:flex; align-items:center; justify-content:center; color:#666; font-size:0.8rem; text-align:center; padding:10px;">No image</div>'
+        hero_preview = (
+            '<div id="hero_image_preview" style="width:100%;height:100%;display:flex;'
+            'align-items:center;justify-content:center;color:#666;font-size:0.8rem;'
+            'text-align:center;padding:10px;">No image</div>'
+        )
         hero_has_file = ""
         hero_filename = "No file selected"
+        hero_url_html = ""
 
     projects_rows = "".join([
         f"""
@@ -639,8 +721,9 @@ def admin():
                 <input type="file" id="hero_image_file" accept="image/png,image/jpeg,image/jpg,image/gif,image/webp,image/svg+xml" style="display:none;">
                 <button type="button" class="btn-green" onclick="uploadHeroImage()" id="heroUploadBtn" style="margin-top:12px; padding:10px 20px; font-size:0.9rem; width:100%;">Upload Image</button>
                 <div id="heroUploadMsg" style="margin-top:8px; font-size:0.85rem;"></div>
+                {hero_url_html}
               </div>
-              <div style="width:160px; height:160px; border-radius:50%; overflow:hidden; border:2px solid rgba(255,255,255,0.15); flex-shrink:0; background:#000;">
+              <div id="heroPreview" style="width:160px; height:160px; border-radius:50%; overflow:hidden; border:2px solid rgba(255,255,255,0.15); flex-shrink:0; background:#000;">
                 {hero_preview}
               </div>
             </div>
@@ -734,16 +817,24 @@ def admin():
           }} catch (e) {{ alert('Network error: ' + e.message); }}
         }}
 
-        // Hero file picker UI
         const heroFileInput = document.getElementById('hero_image_file');
         const heroDrop = document.getElementById('heroDrop');
         const heroFileName = document.getElementById('heroFileName');
+        const heroPreview = document.getElementById('heroPreview');
+        let heroPreviewObjectUrl = null;
         if (heroFileInput) {{
           heroFileInput.addEventListener('change', () => {{
             if (heroFileInput.files.length > 0) {{
               const f = heroFileInput.files[0];
               heroFileName.textContent = f.name + ' (' + Math.round(f.size/1024) + ' KB)';
               heroDrop.classList.add('has-file');
+              if (heroPreviewObjectUrl) URL.revokeObjectURL(heroPreviewObjectUrl);
+              heroPreviewObjectUrl = URL.createObjectURL(f);
+              const previewImage = document.createElement('img');
+              previewImage.src = heroPreviewObjectUrl;
+              previewImage.alt = 'Selected hero image preview';
+              previewImage.style.cssText = 'width:100%;height:100%;object-fit:cover;';
+              heroPreview.replaceChildren(previewImage);
             }}
           }});
         }}
@@ -873,11 +964,16 @@ def admin():
     """
     return html
 
+
 # ---------------- PROJECT FILE STORAGE ----------------
 PROJECT_ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "gif", "webp", "svg"}
 
+
+def _ext(filename: str) -> str:
+    return filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+
+
 def save_project_upload(upload):
-    """Save a project image to S3, or to local static storage if S3 is unavailable."""
     if not upload or not upload.filename:
         return None
 
@@ -885,12 +981,9 @@ def save_project_upload(upload):
     if not original_name:
         raise ValueError("Invalid filename.")
 
-    ext = original_name.rsplit(".", 1)[-1].lower() if "." in original_name else ""
+    ext = _ext(original_name)
     if ext not in PROJECT_ALLOWED_EXTENSIONS:
-        raise ValueError(
-            "Unsupported file type. Only image files are allowed "
-            "(PNG, JPG, JPEG, GIF, WEBP, SVG)."
-        )
+        raise ValueError("Unsupported file type. Only images (PNG, JPG, JPEG, GIF, WEBP, SVG).")
 
     content = upload.read()
     if not content:
@@ -902,34 +995,24 @@ def save_project_upload(upload):
     content_type = upload.mimetype or f"image/{ext}"
     key = f"projects/{stored_name}"
 
-    # Try S3 first. Do not require ACL because many modern S3 buckets disable ACLs.
     if s3 is not None:
         try:
-            s3.upload_fileobj(
-                io.BytesIO(content),
-                BUCKET,
-                key,
-                ExtraArgs={"ContentType": content_type}
-            )
-            endpoint = (os.getenv("AWS_ENDPOINT_URL_S3") or "").rstrip("/")
-            if endpoint:
-                return f"{endpoint}/{BUCKET}/{key}"
-            return f"https://{BUCKET}.s3.amazonaws.com/{key}"
-        except Exception:
-            # Local fallback keeps uploads working if S3 permissions/configuration fail.
-            pass
+            return s3_upload_and_url(key, content, content_type)
+        except Exception as e:
+            app.logger.exception("S3 project upload failed")
+            if IS_VERCEL:
+                raise ValueError(f"S3 upload failed: {e}")
 
-    # Note: Vercel Serverless has a read-only filesystem. Local uploads will NOT persist
-    # in production. You MUST configure S3 for image uploads to work on Vercel.
+    if IS_VERCEL:
+        raise ValueError("S3 is not configured. Set AWS_* env vars and make the bucket publicly readable.")
+
     upload_dir = os.path.join(app.root_path, "static", "uploads", "projects")
-    try:
-        os.makedirs(upload_dir, exist_ok=True)
-        local_path = os.path.join(upload_dir, stored_name)
-        with open(local_path, "wb") as destination:
-            destination.write(content)
-        return f"/static/uploads/projects/{stored_name}"
-    except OSError:
-        raise ValueError("Failed to save image. On Vercel, you must configure S3 credentials for uploads to work.")
+    os.makedirs(upload_dir, exist_ok=True)
+    local_path = os.path.join(upload_dir, stored_name)
+    with open(local_path, "wb") as f:
+        f.write(content)
+    return f"/static/uploads/projects/{stored_name}"
+
 
 # ---------------- ADMIN APIs ----------------
 @app.route("/admin/save", methods=["POST"])
@@ -944,6 +1027,7 @@ def admin_save():
             db.session.add(SiteContent(key=key, value=value))
     db.session.commit()
     return jsonify({"ok": True})
+
 
 @app.route("/admin/presign", methods=["POST"])
 @admin_required
@@ -965,14 +1049,10 @@ def admin_presign():
             Params={"Bucket": BUCKET, "Key": key, "ContentType": content_type},
             ExpiresIn=3600,
         )
-        endpoint = os.getenv("AWS_ENDPOINT_URL_S3", "")
-        if endpoint:
-            file_url = f"{endpoint.rstrip('/')}/{BUCKET}/{key}"
-        else:
-            file_url = f"https://{BUCKET}.s3.amazonaws.com/{key}"
-        return jsonify({"ok": True, "upload_url": upload_url, "file_url": file_url})
+        return jsonify({"ok": True, "upload_url": upload_url, "file_url": s3_public_url(key)})
     except (BotoCoreError, ClientError) as e:
         return jsonify({"ok": False, "error": str(e)}), 500
+
 
 @app.route("/admin/upload-hero", methods=["POST"])
 @admin_required
@@ -984,52 +1064,51 @@ def admin_upload_hero():
         return jsonify({"ok": False, "error": "Empty filename"}), 400
 
     allowed = {"png", "jpg", "jpeg", "gif", "webp", "svg"}
-    ext = file.filename.rsplit(".", 1)[-1].lower() if "." in file.filename else ""
+    ext = _ext(file.filename)
     if ext not in allowed:
         return jsonify({"ok": False, "error": f"Unsupported image type: .{ext}"}), 400
 
     safe_name = "".join(c for c in file.filename if c.isalnum() or c in "._-") or "profile"
     key = f"hero/{uuid.uuid4().hex}_{safe_name}"
-
-    # Read file into memory so we don't get "I/O operation on closed file" if S3 fails
     file_bytes = file.read()
+    if not file_bytes:
+        return jsonify({"ok": False, "error": "Empty file"}), 400
+    if len(file_bytes) > 16 * 1024 * 1024:
+        return jsonify({"ok": False, "error": "File too large (max 16 MB)"}), 400
 
-    # Try S3 first
+    content_type = file.content_type or f"image/{ext}"
     file_url = None
-    s3_failed_error = None
+    s3_error = None
 
     if s3 is not None:
         try:
-            s3.upload_fileobj(
-                io.BytesIO(file_bytes),
-                BUCKET,
-                key,
-                ExtraArgs={"ContentType": file.content_type or f"image/{ext}"}
-            )
-            endpoint = os.getenv("AWS_ENDPOINT_URL_S3", "")
-            if endpoint:
-                file_url = f"{endpoint.rstrip('/')}/{BUCKET}/{key}"
-            else:
-                file_url = f"https://{BUCKET}.s3.amazonaws.com/{key}"
+            file_url = s3_upload_and_url(key, file_bytes, content_type)
         except Exception as e:
-            s3_failed_error = str(e)
+            s3_error = str(e)
+            app.logger.exception("Hero S3 upload failed")
     else:
-        s3_failed_error = S3_ERROR or "S3 client not initialized"
+        s3_error = S3_ERROR or "S3 client not initialized"
 
-    # Fallback to local storage if S3 failed
-    if not file_url:
+    if not file_url and not IS_VERCEL:
         try:
-            upload_dir = os.path.join(app.root_path, "static", "uploads")
+            upload_dir = os.path.join(app.root_path, "static", "uploads", "hero")
             os.makedirs(upload_dir, exist_ok=True)
             local_name = key.split("/")[-1]
-            local_path = os.path.join(upload_dir, local_name)
-            with open(local_path, "wb") as f: 
+            with open(os.path.join(upload_dir, local_name), "wb") as f:
                 f.write(file_bytes)
-            file_url = f"/static/uploads/{local_name}"
-        except Exception as local_e:
-            return jsonify({"ok": False, "error": f"S3 failed ({s3_failed_error}), and local fallback failed ({str(local_e)})"}), 500
+            file_url = f"/static/uploads/hero/{local_name}"
+        except Exception as e:
+            return jsonify({
+                "ok": False,
+                "error": f"S3 failed ({s3_error}), local fallback failed ({e})",
+            }), 500
 
-    # Update DB
+    if not file_url:
+        return jsonify({
+            "ok": False,
+            "error": f"Image upload failed. S3 error: {s3_error}",
+        }), 500
+
     try:
         row = SiteContent.query.filter_by(key="hero_image").first()
         if row:
@@ -1037,27 +1116,26 @@ def admin_upload_hero():
         else:
             db.session.add(SiteContent(key="hero_image", value=file_url))
         db.session.commit()
-        return jsonify({"ok": True, "url": file_url})
-    except Exception as db_e:
-        return jsonify({"ok": False, "error": f"Database error: {str(db_e)}"}), 500
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"Database error: {e}"}), 500
+
+    return jsonify({"ok": True, "url": file_url})
+
 
 @app.route("/admin/projects", methods=["POST"])
 @admin_required
 def admin_create_project():
-    # Supports both the new browser multipart upload and older JSON requests.
     data = request.form if request.form else (request.get_json(silent=True) or {})
     title = (data.get("title") or "").strip()
     slug = (data.get("slug") or "").strip()
     body = (data.get("body") or "").strip()
 
-    # For image-based projects, body is optional. Use summary or title as fallback.
     if not body:
         body = (data.get("summary") or "").strip() or title
 
     if not title:
         return jsonify({"ok": False, "error": "Title is required."}), 400
 
-    # Auto-generate slug if not provided (so the admin doesn't have to type one).
     if not slug:
         base_slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-") or "project"
         slug = base_slug
@@ -1100,6 +1178,7 @@ def admin_create_project():
 
     return jsonify({"ok": True, "id": p.id, "file_url": file_url})
 
+
 @app.route("/admin/projects/<int:pid>", methods=["DELETE"])
 @admin_required
 def admin_delete_project(pid):
@@ -1109,6 +1188,7 @@ def admin_delete_project(pid):
     db.session.delete(p)
     db.session.commit()
     return jsonify({"ok": True})
+
 
 @app.route("/admin/messages/<int:mid>", methods=["DELETE"])
 @admin_required
@@ -1120,22 +1200,14 @@ def admin_delete_message(mid):
     db.session.commit()
     return jsonify({"ok": True})
 
+
 # ---------------- PUBLIC PROJECT DETAIL ----------------
 @app.route("/project/<path:slug_or_url>")
 def project_detail(slug_or_url):
-    """
-    Supports:
-    1. Normal project slugs: /project/my-project
-    2. Project IDs: /project/123
-    3. Canva URLs: /project/https://www.canva.com/design/.../edit
-    """
     value = unquote(slug_or_url).strip()
 
-    # Handle external project URLs such as Canva.
     if value.startswith(("https://", "http://")):
         parsed = urlparse(value)
-
-        # Only allow HTTPS Canva links.
         hostname = (parsed.hostname or "").lower()
 
         if parsed.scheme != "https":
@@ -1146,12 +1218,10 @@ def project_detail(slug_or_url):
 
         return redirect(value, code=302)
 
-    # Try lookup by numeric ID first (used by new image-based projects).
     p = None
     if value.isdigit():
         p = db.session.get(Project, int(value))
 
-    # Fall back to slug lookup.
     if not p:
         p = Project.query.filter_by(slug=value).first()
 
@@ -1170,15 +1240,20 @@ def project_detail(slug_or_url):
         if p.tech_stack else ""
     )
 
-    # Render the uploaded image prominently on the detail page.
     image_html = ""
     if p.file_url:
+        safe_file_url = p.file_url.replace('"', "%22")
         image_html = f"""
             <div style="margin-top:30px;">
-                <img src="{p.file_url}" alt="{p.title}"
+                <img src="{safe_file_url}" alt="{p.title}"
                     style="display:block;width:100%;max-height:700px;
                     object-fit:contain;border-radius:12px;
-                    border:1px solid rgba(255,255,255,0.08);">
+                    border:1px solid rgba(255,255,255,0.08);"
+                    onerror="this.style.display='none';
+                    var d=document.createElement('div');
+                    d.style.cssText='padding:20px;border:1px dashed #ef4444;border-radius:12px;color:#ef4444;text-align:center;';
+                    d.textContent='Project image could not be loaded.';
+                    this.parentNode.appendChild(d);">
             </div>
         """
 
@@ -1229,15 +1304,37 @@ def project_detail(slug_or_url):
     </html>
     """
 
+
+# ---------------- MEDIA PROXY (optional fallback if bucket is private) ----------------
+@app.route("/media/<path:key>")
+def media(key):
+    if s3 is None:
+        return "S3 not configured", 500
+    try:
+        obj = s3.get_object(Bucket=BUCKET, Key=key)
+        return Response(
+            obj["Body"].read(),
+            mimetype=obj.get("ContentType", "application/octet-stream"),
+            headers={"Cache-Control": "public, max-age=3600"},
+        )
+    except ClientError:
+        return "Not found", 404
+
+
 # ---------------- HEALTH ----------------
 @app.route("/healthz")
 def healthz():
-    return jsonify({"ok": True, "time": datetime.now(timezone.utc).isoformat()})
+    return jsonify({
+        "ok": True,
+        "time": datetime.now(timezone.utc).isoformat(),
+        "s3": s3 is not None,
+        "s3_error": S3_ERROR,
+        "bucket": BUCKET,
+    })
+
 
 # ---------------- STARTUP ----------------
-# Vercel requires the Flask app to be named 'app', which it is above.
 if __name__ == "__main__":
-    # Local development server
     port = int(os.getenv("PORT", "5000"))
     debug = os.getenv("FLASK_DEBUG", "0") == "1"
     app.run(host="0.0.0.0", port=port, debug=debug)
