@@ -1023,7 +1023,7 @@ def admin_upload_hero():
             os.makedirs(upload_dir, exist_ok=True)
             local_name = key.split("/")[-1]
             local_path = os.path.join(upload_dir, local_name)
-            with open(local_path, "wb") as f:
+            with open(local_path, "wb") as f: 
                 f.write(file_bytes)
             file_url = f"/static/uploads/{local_name}"
         except Exception as local_e:
