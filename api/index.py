@@ -18,15 +18,7 @@ load_dotenv()
 
 IS_VERCEL = os.getenv("VERCEL") == "1"
 if IS_VERCEL:
-    required_env = (
-        "DATABASE_URL",
-        "SECRET_KEY",
-        "ADMIN_PASSWORD",
-        "AWS_ENDPOINT_URL_S3",
-        "AWS_ACCESS_KEY_ID",
-        "AWS_SECRET_ACCESS_KEY",
-        "NEON_S3_BUCKET",
-    )
+    required_env = ("DATABASE_URL", "SECRET_KEY", "ADMIN_PASSWORD")
     missing_env = [
         name for name in required_env
         if not os.getenv(name, "").strip()
@@ -68,25 +60,14 @@ try:
         region_name=os.getenv("AWS_DEFAULT_REGION", "us-east-2"),
         config=Config(
             signature_version="s3v4",
-            s3={"addressing_style": "path"},
-            request_checksum_calculation="when_required",
+            s3={"addressing_style": "path"}  # FIX: Required for Neon Object Storage
         ),
     )
 except Exception as e:
     s3 = None
     S3_ERROR = str(e)
 
-BUCKET = os.getenv("NEON_S3_BUCKET", "").strip() or "s3-bucket-1232"
-
-
-def s3_upload_error_message(error):
-    error_code = getattr(error, "response", {}).get("Error", {}).get("Code")
-    if error_code == "NoSuchBucket":
-        return (
-            "The Neon bucket was not found. Check that NEON_S3_BUCKET exactly "
-            "matches an existing bucket on the branch configured by AWS_ENDPOINT_URL_S3."
-        )
-    return f"S3 upload failed: {error}"
+BUCKET = os.getenv("NEON_S3_BUCKET", "s3-bucket-1232")
 
 # ---------------- FONTS ----------------
 FONT_CHOICES = {
@@ -580,7 +561,6 @@ def admin():
     if current_hero:
         safe_hero = current_hero.replace('"', "%22")
         
-        # FIX: Updated error message to mention Neon specifically
         onerr = (
             "this.onerror=null;"
             "this.style.display='none';"
@@ -968,6 +948,8 @@ def save_project_upload(upload):
 
     if s3 is not None:
         try:
+            # FIX: Removed ACL requirement (Neon does not support it). 
+            # Path-style addressing is set globally in the Config.
             s3.upload_fileobj(
                 io.BytesIO(content),
                 BUCKET,
@@ -978,10 +960,8 @@ def save_project_upload(upload):
             if endpoint:
                 return f"{endpoint}/{BUCKET}/{key}"
             return f"https://{BUCKET}.s3.amazonaws.com/{key}"
-        except Exception as error:
-            app.logger.exception("S3 project upload failed")
-            if IS_VERCEL:
-                raise ValueError(s3_upload_error_message(error)) from error
+        except Exception:
+            pass
 
     if IS_VERCEL:
         raise ValueError(
@@ -1066,6 +1046,7 @@ def admin_upload_hero():
 
     if s3 is not None:
         try:
+            # FIX: Removed ACL requirement.
             s3.upload_fileobj(
                 io.BytesIO(file_bytes),
                 BUCKET,
@@ -1078,8 +1059,7 @@ def admin_upload_hero():
             else:
                 file_url = f"https://{BUCKET}.s3.amazonaws.com/{key}"
         except Exception as e:
-            s3_failed_error = s3_upload_error_message(e)
-            app.logger.exception("Hero S3 upload failed")
+            s3_failed_error = str(e)
     else:
         s3_failed_error = S3_ERROR or "S3 client not initialized"
 
@@ -1306,4 +1286,3 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
     debug = os.getenv("FLASK_DEBUG", "0") == "1"
     app.run(host="0.0.0.0", port=port, debug=debug)
-    
